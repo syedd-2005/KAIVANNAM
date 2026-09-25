@@ -1,0 +1,8 @@
+streamlit
+plotly
+pandas
+numpy
+Pillow
+requests
+qrcode[pil]
+groq
