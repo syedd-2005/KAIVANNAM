@@ -36,7 +36,7 @@ except Exception:
 APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "data" / "kaivannam.db"
 PRODUCT_DIR = APP_DIR / "assets" / "products"
-LOGO_DIR = APP_DIR 
+LOGO_DIR = APP_DIR / "assets" / "logo"
 
 # UPI ID used to generate the payment QR code.
 # Replace this with your real merchant UPI ID.
@@ -168,7 +168,7 @@ DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 st.set_page_config(
     page_title="KAIVANNAM – கைவண்ணம்",
-    page_icon="logo.png",
+    page_icon="🧵",
     layout="wide"
 )
 
@@ -1345,37 +1345,51 @@ def ai_client():
 
 
 def gemini_generate(prompt, image_bytes=None, mime_type="image/jpeg"):
-    """Call Gemini only for the requested AI features, using GEMINI_API_KEY from Streamlit secrets."""
+    """Reliable Gemini text/vision call used by both customer and seller image AI."""
     try:
         api_key = st.secrets.get("GEMINI_API_KEY")
         if not api_key or api_key == "YOUR_API_KEY_HERE":
             return ""
 
-        parts = [{"text": prompt}]
+        parts = []
         if image_bytes:
-            parts.insert(0, {
+            parts.append({
                 "inline_data": {
                     "mime_type": mime_type,
                     "data": base64.b64encode(image_bytes).decode("utf-8")
                 }
             })
+        parts.append({"text": prompt})
 
-        response = requests.post(
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent",
-            headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
-            json={"contents": [{"role": "user", "parts": parts}]},
-            timeout=45
-        )
-        if not response.ok:
-            return ""
-        payload = response.json()
-        candidates = payload.get("candidates") or []
-        if not candidates:
-            return ""
-        output_parts = (candidates[0].get("content") or {}).get("parts") or []
-        return "".join(str(part.get("text", "")) for part in output_parts).strip()
+        # Keep Gemini as the primary image provider because this path is
+        # independent of the Groq vision model and uses the configured Gemini key.
+        for model in ("gemini-3.8-flash", "gemini-3.7-flash"):
+            try:
+                response = requests.post(
+                    f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                    headers={
+                        "x-goog-api-key": api_key,
+                        "Content-Type": "application/json"
+                    },
+                    json={
+                        "contents": [{"role": "user", "parts": parts}]
+                    },
+                    timeout=45
+                )
+                if not response.ok:
+                    continue
+                payload = response.json()
+                for candidate in payload.get("candidates") or []:
+                    content = candidate.get("content") or {}
+                    output_parts = content.get("parts") or []
+                    text = "".join(str(part.get("text", "")) for part in output_parts).strip()
+                    if text:
+                        return text
+            except Exception:
+                continue
     except Exception:
-        return ""
+        pass
+    return ""
 
 
 def ai_call(prompt):
@@ -1408,6 +1422,41 @@ def ai_call(prompt):
 
     except Exception:
         return None
+
+
+
+def groq_vision_generate(prompt, image_bytes, mime_type="image/jpeg"):
+    """Groq vision backup. Returns empty text on provider failure."""
+    client = ai_client()
+    if not client or not image_bytes:
+        return ""
+    try:
+        encoded = base64.b64encode(image_bytes).decode("utf-8")
+        response = client.chat.completions.create(
+            model="qwen/qwen3.8-27b",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are KAIVANNAM's visual product analyst. Analyze ONLY the exact image supplied. "
+                        "Describe visible facts and do not invent unsupported details."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{encoded}"}}
+                    ]
+                }
+            ],
+            temperature=0.1,
+            max_completion_tokens=900,
+            stream=False
+        )
+        return (response.choices[0].message.content or "").strip()
+    except Exception:
+        return ""
 
 
 def ai_product_pricing_and_description(name, craft, category, state, district, material, image_path, fallback_price, fallback_description):
@@ -1499,29 +1548,40 @@ def ai_product_pricing_and_description(name, craft, category, state, district, m
 
 
 def ai_product_image_price_and_description(image_path, name="", craft="", category="", state="", district="", material="", fallback_price=500.0, fallback_description=""):
-    """Analyze the EXACT uploaded seller image with Gemini and generate AI price + description."""
-    if not image_path:
-        return float(fallback_price), ""
+    """Generate description and price from the uploaded product image."""
+    client = ai_client()
+    if not client or not image_path:
+        return float(fallback_price), fallback_description
 
     try:
         full_path = APP_DIR / image_path
         if not full_path.exists():
-            return float(fallback_price), ""
+            return float(fallback_price), fallback_description
 
+        # Normalize mobile-camera photos before sending them to the vision model.
+        # This fixes the common EXIF rotation used by phone cameras while keeping
+        # the original uploaded file untouched for the final product image.
         image_bytes = full_path.read_bytes()
-        try:
-            from PIL import Image, ImageOps
-            from io import BytesIO
-            image = Image.open(BytesIO(image_bytes))
-            image = ImageOps.exif_transpose(image).convert("RGB")
-            image.thumbnail((1600, 1600), Image.Resampling.LANCZOS)
-            buffer = BytesIO()
-            image.save(buffer, format="JPEG", quality=88, optimize=True)
-            image_bytes = buffer.getvalue()
-        except Exception:
-            pass
+        suffix = full_path.suffix.lower()
+        mime = (
+            "image/png" if suffix == ".png"
+            else "image/webp" if suffix == ".webp"
+            else "image/jpeg"
+        )
+        if suffix in {".jpg", ".jpeg"}:
+            try:
+                from PIL import Image, ImageOps
+                from io import BytesIO
+                image = Image.open(BytesIO(image_bytes))
+                image = ImageOps.exif_transpose(image).convert("RGB")
+                buffer = BytesIO()
+                image.save(buffer, format="JPEG", quality=92)
+                image_bytes = buffer.getvalue()
+            except Exception:
+                pass
+        encoded = base64.b64encode(image_bytes).decode("utf-8")
 
-        language = {
+        description_language = {
             "English": "English",
             "தமிழ்": "Tamil (தமிழ்)",
             "हिन्दी": "Hindi (हिन्दी)",
@@ -1530,37 +1590,221 @@ def ai_product_image_price_and_description(image_path, name="", craft="", catego
             "ಕನ್ನಡ": "Kannada (ಕನ್ನಡ)"
         }.get(current_lang(), "English")
 
-        prompt = (
-            "Analyze ONLY the single uploaded product image attached to this request. "
-            "Generate a marketplace listing for that exact image. Return ONLY valid JSON with exactly two keys: description and recommended_price. "
-            f"Write the description ONLY in {language}. "
-            "The description must contain only visible, supportable product details such as appearance, shape, colors, pattern, visible material and craftsmanship. "
-            "Do not invent an artisan name, location, history, heritage claim, brand, measurements, material or technique unless clearly identifiable from the image. "
-            "For recommended_price, estimate a fair affordable Indian artisan selling price based on the visible product, its apparent size, complexity, craftsmanship and materials. Use a whole INR number. "
-            "Do not use a fixed demo/default price simply because the image is unclear. "
-            f"Seller-entered hints (use only if consistent with the image): product name={name or 'blank'}, craft={craft or 'blank'}, category={category or 'blank'}, "
-            f"state={state or 'blank'}, district={district or 'blank'}, material={material or 'blank'}. "
-            "The uploaded image is the primary source of truth."
+        # Fetch fresh public marketplace prices so the AI price is grounded in
+        # current comparable listings instead of being based only on an estimate.
+        market_lines = []
+        market_prices = []
+        try:
+            base_terms = [x for x in [name, craft, material, category, state] if x and str(x).strip()]
+            search_base = " ".join(str(x).strip() for x in base_terms[:5]) + " handmade India price"
+            marketplace_queries = [
+                search_base + " site:amazon.in",
+                search_base + " site:flipkart.com",
+                search_base + " site:etsy.com",
+                search_base + " site:indiahandmade.com",
+            ]
+            for query in marketplace_queries:
+                url = "https://html.duckduckgo.com/html/?q=" + urllib.parse.quote(query)
+                req = urllib.request.Request(
+                    url,
+                    headers={
+                        "User-Agent":
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 Chrome/153 Safari/537.36"
+                    }
+                )
+                with urllib.request.urlopen(req, timeout=8) as resp:
+                    page = resp.read().decode("utf-8", errors="ignore")
+                page_text = re.sub(
+                    r"<script.*?</script>|<style.*?</style>",
+                    " ",
+                    page,
+                    flags=re.S | re.I
+                )
+                page_text = re.sub(r"<[^>]+>", " ", page_text)
+                page_text = html_lib.unescape(re.sub(r"\s+", " ", page_text)).strip()
+
+                # Keep marketplace snippets and extract only plausible INR prices.
+                for match in re.finditer(
+                    r"(.{0,180}(?:₹|Rs\.?|INR)\s?([0-9][0-9,]*(?:\.[0-9]{1,2})?).{0,180})",
+                    page_text,
+                    re.I
+                ):
+                    snippet = match.group(1).strip()
+                    try:
+                        value = float(match.group(2).replace(",", ""))
+                    except Exception:
+                        continue
+                    if 50 <= value <= 100000:
+                        market_prices.append(value)
+                        if snippet not in market_lines:
+                            market_lines.append(snippet)
+                    if len(market_lines) >= 20:
+                        break
+                if len(market_lines) >= 20:
+                    break
+        except Exception:
+            pass
+
+        # Use the median of fresh comparable listings as a stable market anchor.
+        market_anchor = None
+        if market_prices:
+            ordered_prices = sorted(market_prices)
+            mid = len(ordered_prices) // 2
+            market_anchor = (
+                ordered_prices[mid]
+                if len(ordered_prices) % 2
+                else (ordered_prices[mid - 1] + ordered_prices[mid]) / 2
+            )
+
+        market_reference = "\n".join(market_lines) if market_lines else "No current marketplace price references were retrieved."
+        anchor_text = (
+            f"Fresh marketplace price median: ₹{market_anchor:,.0f}."
+            if market_anchor is not None
+            else "No reliable marketplace median was available."
         )
 
-        raw = gemini_generate(prompt, image_bytes=image_bytes, mime_type="image/jpeg")
+        prompt = (
+            "Analyze the uploaded artisan product image. Return ONLY valid JSON with exactly two keys: "
+            "description and recommended_price. "
+            "Write the description ONLY in English. This English description is the canonical product description "
+            "and will be translated separately into the dashboard-selected language. "
+            "The description must be a clear marketplace description based on what is visibly shown: "
+            "appearance, shape, colors, visible design, and material/technique only when identifiable. "
+            "Do not invent location, artisan identity, history, or unsupported facts. "
+            "For recommended_price, use the CURRENT marketplace references below as a benchmark, but make the final price "
+            "affordable for low-income/marginal customers while still giving the artisan a fair return for materials, skill, "
+            "time and craftsmanship. For comparable products, target roughly 75-90% of the reliable marketplace median rather "
+            "than premium marketplace pricing. Do not underprice skilled handmade work or choose an unrealistically cheap price. "
+            "If the marketplace references are noisy or unavailable, estimate a fair affordable Indian artisan price from the "
+            "visible size, materials, complexity and craftsmanship. Prefer practical rounded prices such as 199, 249, 299, 349, "
+            "399, 449, 499, 599, 699, 799, 899, 999, 1199, 1499, etc., as appropriate. "
+            "The suggested price must balance customer affordability and artisan earnings; it is a recommendation and the seller "
+            "can edit it before saving. Use a whole number between 100 and 50000. "
+            f"Seller product name: {name or 'blank'}; craft type: {craft or 'blank'}; category: {category or 'blank'}; "
+            f"state: {state or 'blank'}; district: {district or 'blank'}; material: {material or 'blank'}.\n\n"
+            f"{anchor_text}\n"
+            "CURRENT MARKETPLACE REFERENCES:\n" + market_reference
+        )
+
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are KAIVANNAM's product listing assistant. Return only valid JSON. "
+                    "The description MUST be written only in English. Do not translate it here; "
+                    "the English description will be translated separately after image analysis."
+                )
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{mime};base64,{encoded}"
+                        }
+                    }
+                ]
+            }
+        ]
+
+        raw = ""
+        for model in [
+            "meta-llama/llama-4-scout-17b-16e-instruct",
+            "qwen/qwen3.8-27b"
+        ]:
+            try:
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    temperature=0.1,
+                    max_completion_tokens=500
+                )
+                raw = (response.choices[0].message.content or "").strip()
+                if raw:
+                    break
+            except Exception:
+                continue
         match = re.search(r"\{.*\}", raw, re.S)
         if not match:
-            return float(fallback_price), ""
+            return float(fallback_price), fallback_description
 
         data = __import__("json").loads(match.group(0))
-        description = str(data.get("description", "")).strip()
-        if not description:
-            return float(fallback_price), ""
+        english_description = str(data.get("description", "")).strip() or fallback_description
+        description = english_description
+
+        # Generate the product description in English first, then translate that
+        # canonical description into the dashboard-selected language. This keeps
+        # the image analysis consistent while allowing the seller to switch
+        # languages without changing the product facts.
+        if english_description and current_lang() != "English":
+            translation_language = {
+                "தமிழ்": "Tamil (தமிழ்)",
+                "हिन्दी": "Hindi (हिन्दी)",
+                "മലയാളം": "Malayalam (മലയാളം)",
+                "తెలుగు": "Telugu (తెలుగు)",
+                "ಕನ್ನಡ": "Kannada (ಕನ್ನಡ)"
+            }.get(current_lang(), current_lang())
+            try:
+                translation_response = client.chat.completions.create(
+                    model="qwen/qwen3.8-27b",
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are KAIVANNAM's product-description translator. "
+                                f"Translate the English product description into {translation_language}. "
+                                "Preserve the exact product facts and meaning. Do not add, remove, or invent details. "
+                                "Return only the translated description, with no labels or explanation."
+                            )
+                        },
+                        {
+                            "role": "user",
+                            "content": english_description
+                        }
+                    ],
+                    temperature=0.1,
+                    max_completion_tokens=500
+                )
+                translated = (translation_response.choices[0].message.content or "").strip()
+                if translated:
+                    description = translated
+                else:
+                    raise ValueError("Empty translation")
+            except Exception:
+                fallback_translation = ai_call(
+                    "Translate the following product description into "
+                    f"{translation_language}. Preserve every product fact and detail exactly. "
+                    "Do not add, remove, summarize, or explain anything. Return only the translated description.\n\n"
+                    + english_description
+                )
+                if fallback_translation and fallback_translation.strip():
+                    description = fallback_translation.strip()
+                else:
+                    description = english_description
 
         try:
-            recommended_price = int(round(float(data.get("recommended_price", fallback_price))))
+            ai_price = float(data.get("recommended_price", fallback_price))
         except Exception:
-            recommended_price = int(round(float(fallback_price)))
+            ai_price = float(fallback_price)
+
+        # Keep the description logic from the earlier working version.
+        # For price, make KAIVANNAM moderately cheaper than comparable
+        # marketplace listings when a reliable market median is available.
+        if market_anchor is not None:
+            recommended_price = int(round((market_anchor * 0.80) / 10.0) * 10)
+            # Do not let the AI push the price back up above the competitive
+            # marketplace target. The seller can still edit it before saving.
+            recommended_price = min(recommended_price, int(round(ai_price)))
+        else:
+            recommended_price = int(round(ai_price))
+
         recommended_price = max(100, min(50000, recommended_price))
         return float(recommended_price), description
     except Exception:
-        return float(fallback_price), ""
+        return float(fallback_price), fallback_description
 
 
 def ai_mode():
@@ -4779,12 +5023,6 @@ def stories():
         width="stretch"
     )
 
-    if not ai_client():
-        st.warning(
-            "Add GROQ_API_KEY to .streamlit/secrets.toml to generate the craft story."
-        )
-        return
-
     if st.button(
         "✨ Generate Craft Story",
         type="primary",
@@ -5085,83 +5323,6 @@ def ai_shopping():
                         r,
                         "ai"
                     )
-
-
-# ============================================================
-# AI IMAGE ANALYZER
-# ============================================================
-
-def ai_analyze_uploaded_image_bytes(image_bytes):
-    """Analyze ONLY the exact image uploaded by the customer using Gemini."""
-    if not image_bytes:
-        return ""
-
-    try:
-        from PIL import Image, ImageOps
-        from io import BytesIO
-
-        image = Image.open(BytesIO(image_bytes))
-        image = ImageOps.exif_transpose(image).convert("RGB")
-        buffer = BytesIO()
-        image.save(buffer, format="JPEG", quality=92)
-        normalized_bytes = buffer.getvalue()
-
-        language = {
-            "English": "English",
-            "தமிழ்": "Tamil (தமிழ்)",
-            "हिन्दी": "Hindi (हिन्दी)",
-            "മലയാളം": "Malayalam (മലയാളം)",
-            "తెలుగు": "Telugu (తెలుగు)",
-            "ಕನ್ನಡ": "Kannada (ಕನ್ನಡ)"
-        }.get(current_lang(), "English")
-
-        prompt = (
-            "Analyze ONLY the exact uploaded image attached to this request. "
-            f"Respond only in {language}. "
-            "Do not use a default sample description, demo text, previous image, catalog item, memory, seller/customer details, or unrelated information. "
-            "Describe only visible and reasonably identifiable details. If something cannot be identified from the image, say that it cannot be determined. "
-            "Do not invent a specific artisan, place, history, material, price, or cultural claim. Give a concise factual analysis."
-        )
-        return gemini_generate(prompt, image_bytes=normalized_bytes, mime_type="image/jpeg")
-    except Exception:
-        return ""
-
-
-def ai_image_analyzer():
-
-    st.title(
-        f"🔍 {T('AI Image Analyzer')}"
-    )
-
-    upload = st.file_uploader(
-        T("Upload a craft/product image"),
-        type=["png", "jpg", "jpeg", "webp"],
-        accept_multiple_files=False,
-        key="customer_ai_image_upload"
-    )
-
-    if not upload:
-        st.info(T("Upload an image to analyze it."))
-        return
-
-    image_bytes = upload.getvalue()
-    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    st.image(image, width=500)
-    st.info(ai_mode())
-
-    upload_hash = hashlib.sha256(image_bytes).hexdigest()[:16]
-    result_key = f"customer_ai_image_result_{upload_hash}_{current_lang()}"
-
-    if result_key not in st.session_state:
-        with st.spinner("🔎 Analyzing the uploaded image..."):
-            result = ai_analyze_uploaded_image_bytes(image_bytes)
-        st.session_state[result_key] = result
-
-    result = st.session_state.get(result_key, "")
-    if result:
-        st.write(result)
-    else:
-        st.warning("The uploaded image could not be analyzed. Please check the AI connection and try again.")
 
 
 # ============================================================
@@ -5952,9 +6113,13 @@ def add_product():
     # Apply AI-generated values before the widgets are created so Streamlit
     # displays the generated price and description immediately after upload.
     if st.session_state.get("add_product_apply_ai", False):
-        st.session_state["add_product_price"] = float(
-            st.session_state.get("add_product_ai_price", 500.0)
-        )
+        ai_price_value = st.session_state.get("add_product_ai_price")
+        try:
+            if ai_price_value is not None and float(ai_price_value) > 0:
+                st.session_state["add_product_price"] = float(ai_price_value)
+        except (TypeError, ValueError):
+            pass
+
         st.session_state["add_product_description"] = st.session_state.get(
             "add_product_ai_description", ""
         )
@@ -6003,11 +6168,18 @@ def add_product():
         T("Material")
     )
 
+    stored_price = st.session_state.get("add_product_price", 500.0)
+    try:
+        stored_price = float(stored_price) if stored_price is not None else 500.0
+    except (TypeError, ValueError):
+        stored_price = 500.0
+    stored_price = max(1.0, min(100000.0, stored_price))
+
     price = st.number_input(
         "Price (₹)",
         1.0,
         100000.0,
-        float(st.session_state.get("add_product_ai_price", 500.0)),
+        stored_price,
         step=100.0,
         key="add_product_price"
     )
@@ -6096,15 +6268,23 @@ def add_product():
                     # Generate the craft story automatically from the SAME uploaded image.
                     ai_story = generate_craft_story_from_image_bytes(upload_bytes)
 
-                    st.session_state["add_product_ai_price"] = float(ai_price)
-                    st.session_state["add_product_craft_story"] = ai_story
+                    try:
+                        st.session_state["add_product_ai_price"] = (
+                            float(ai_price) if ai_price is not None and float(ai_price) > 0 else 0.0
+                        )
+                    except (TypeError, ValueError):
+                        st.session_state["add_product_ai_price"] = 0.0
+                    st.session_state["add_product_craft_story"] = ai_story or ""
                     st.session_state["add_product_ai_description"] = ai_description
                     st.session_state["add_product_upload_sig"] = upload_sig
                     st.session_state["add_product_ai_language"] = current_lang()
-                    st.session_state["add_product_apply_ai"] = True
+                    st.session_state["add_product_apply_ai"] = bool(ai_description or ai_price or ai_story)
 
-                    if not ai_description:
-                        st.warning("AI could not generate the description. Please check GROQ_API_KEY / AI connection.")
+                    if not ai_description or not ai_price or not ai_story:
+                        st.warning(
+                            "Live image AI did not return all requested fields. "
+                            "No default/demo description, price, or story was inserted."
+                        )
             finally:
                 if preview_path and preview_path.exists():
                     try:
@@ -6994,7 +7174,6 @@ def sidebar():
             ("Orders", T("Orders")),
             ("Returns & Refunds", "Returns & Refunds"),
             ("Heritage Map", T("Heritage Map")),
-            ("AI Image Analyzer", T("AI Image Analyzer")),
             ("AI Shopping Assistant", T("AI Shopping Assistant")),
             ("Voice Assistant", T("Voice Assistant")),
             ("Profile", T("Profile"))
@@ -7138,9 +7317,6 @@ def main():
 
         "Heritage Map":
             heritage_map,
-
-        "AI Image Analyzer":
-            ai_image_analyzer,
 
         "AI Shopping Assistant":
             ai_shopping,
