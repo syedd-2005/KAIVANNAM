@@ -168,7 +168,7 @@ DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 st.set_page_config(
     page_title="KAIVANNAM – கைவண்ணம்",
-    page_icon="🧵",
+    page_icon="logo.png",
     layout="wide"
 )
 
