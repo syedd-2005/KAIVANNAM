@@ -36,7 +36,7 @@ except Exception:
 APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "data" / "kaivannam.db"
 PRODUCT_DIR = APP_DIR / "assets" / "products"
-LOGO_DIR = APP_DIR / "assets" / "logo"
+LOGO_DIR = APP_DIR 
 
 # UPI ID used to generate the payment QR code.
 # Replace this with your real merchant UPI ID.
